@@ -118,19 +118,39 @@ export default function App() {
   const [isDragging, setIsDragging] = useState(false);
   const [internalClipboard, setInternalClipboard] = useState<{ minRow: number, minCol: number, tsv: string } | null>(null);
 
-  // Sync cell selection to grid context
+  // Phase 7: Context Menu
+  const [contextMenu, setContextMenu] = useState<{ x: number, y: number, a1: string } | null>(null);
+
+  // Parse global aliases map to show inside the grid
+  const cellAliases = useMemo(() => {
+    const map = new Map<string, string>(); // A1 -> AliasName
+    formulaState.split('\n').forEach(line => {
+      const matchAlias = line.match(/^ALIAS\s+\[(.*?)\]\s*=\s*([A-Z0-9]+)$/i);
+      if (matchAlias) {
+         map.set(matchAlias[2].toUpperCase(), matchAlias[1]);
+      }
+    });
+    return map;
+  }, [formulaState]);
+
+  // Sync cell selection and aliases to grid context
   useEffect(() => {
     if (gridApiRef.current) {
-      gridApiRef.current.setGridOption('context', { selectionStart, selectionEnd });
+      gridApiRef.current.setGridOption('context', { selectionStart, selectionEnd, cellAliases });
       gridApiRef.current.refreshCells({ force: true });
     }
-  }, [selectionStart, selectionEnd]);
+  }, [selectionStart, selectionEnd, cellAliases]);
 
-  // Global mouseup to stop dragging
+  // Global listeners (mouseup, click off context menu)
   useEffect(() => {
     const handleMouseUp = () => setIsDragging(false);
+    const handleClickOffMenu = () => setContextMenu(null);
     window.addEventListener('mouseup', handleMouseUp);
-    return () => window.removeEventListener('mouseup', handleMouseUp);
+    window.addEventListener('click', handleClickOffMenu);
+    return () => {
+       window.removeEventListener('mouseup', handleMouseUp);
+       window.removeEventListener('click', handleClickOffMenu);
+    }
   }, []);
 
   // Copy / Paste handling
@@ -405,30 +425,49 @@ export default function App() {
   }, [dataState, formulaState, hf, monaco, focusedCell]);
 
   const customCellRenderer = (params: any) => {
-    if (!params.colDef) return null;
-    const field = params.colDef.field;
-    const isError = params.data[`_${field}_isError`];
-    const isFormula = params.data[`_${field}_isFormula`];
-    
-    let backgroundColor = 'transparent';
-    if (isError) {
-      backgroundColor = '#fee2e2';
-    } else if (isFormula) {
-      backgroundColor = '#f0fdf4';
-    }
+  const { value, data, context, colDef, rowIndex } = params;
+  if (!data || !colDef) return null;
+  const colLetter = colDef.field;
+  const a1 = `${colLetter}${rowIndex + 1}`;
+  
+  const aliasName = context?.cellAliases?.get(a1);
+  const isFormula = data[`_${colLetter}_isFormula`]; // Use the stored flag
+  const isError = data[`_${colLetter}_isError`]; // Use the stored flag
+  let displayVal = value;
+  if (value && typeof value === 'object') {
+    displayVal = '#ERROR';
+  }
 
-    return (
-      <div style={{
-        width: '100%', height: '100%', backgroundColor,
-        color: isError ? '#ef4444' : 'inherit',
-        fontWeight: isError ? 'bold' : 'normal',
-        padding: '0 8px', boxSizing: 'border-box',
-        overflow: 'hidden', whiteSpace: 'nowrap'
-      }}>
-        {params.value}
-      </div>
-    );
-  };
+  let backgroundColor = 'transparent';
+  if (isError) {
+    backgroundColor = '#fee2e2';
+  } else if (isFormula) {
+    backgroundColor = '#f0fdf4';
+  }
+
+  return (
+    <div style={{
+      position: 'relative', width: '100%', height: '100%', backgroundColor,
+      color: isError ? '#ef4444' : 'inherit',
+      fontWeight: isError ? 'bold' : 'normal',
+      padding: '0 8px', boxSizing: 'border-box',
+      overflow: 'hidden', whiteSpace: 'nowrap',
+      display: 'flex', alignItems: 'center' // Align content vertically
+    }}>
+      <span style={{ flexGrow: 1 }}>{displayVal}</span>
+      {aliasName && (
+         <span style={{ 
+            position: 'absolute', right: '4px', top: '50%', transform: 'translateY(-50%)', 
+            fontSize: '10px', color: '#888',
+            backgroundColor: '#eee', padding: '2px 4px', borderRadius: '4px',
+            pointerEvents: 'none', userSelect: 'none'
+         }}>
+           {aliasName}
+         </span>
+      )}
+    </div>
+  );
+};
 
   const columnDefs = useMemo<ColDef[]>(() => {
     return Array.from({ length: 10 }).map((_, i) => {
@@ -576,6 +615,26 @@ export default function App() {
     setSelectionEnd({ col: colIndex, row: rowIndex });
   };
 
+  const onCellContextMenu = (params: any) => {
+    params.event.preventDefault(); // Stop native browser menu
+    const colIndex = params.column.getColId();
+    const rowIndex = params.rowIndex;
+    const a1 = `${colIndex}${rowIndex + 1}`;
+    // Show menu slightly offset from the exact click location
+    setContextMenu({ x: params.event.clientX, y: params.event.clientY, a1 });
+  };
+
+  const handleSetAlias = () => {
+    if (!contextMenu) return;
+    const name = window.prompt(`Enter an alias name for cell ${contextMenu.a1} (e.g. HP):`);
+    if (name && name.trim()) {
+       // Append to formulaState
+       const newFormula = formulaState.trim() + (formulaState.trim() ? '\n' : '') + `ALIAS [${name.trim()}] = ${contextMenu.a1}`;
+       setFormulaState(newFormula);
+    }
+    setContextMenu(null);
+  };
+
   const handleFormulaBarKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter' && focusedCell) {
       commitCellChange(focusedCell, formulaBarText);
@@ -608,7 +667,7 @@ export default function App() {
 
         <div className="ag-theme-quartz" style={{ flex: 1, height: '100%' }}>
           <AgGridReact
-            context={{ selectionStart, selectionEnd }}
+            context={{ selectionStart, selectionEnd, cellAliases }}
             rowData={rowData}
             columnDefs={columnDefs}
             getRowId={(params) => params.data.id}
@@ -616,11 +675,37 @@ export default function App() {
             onCellFocused={onCellFocused}
             onCellMouseDown={onCellMouseDown}
             onCellMouseOver={onCellMouseOver}
+            onCellContextMenu={onCellContextMenu}
             onGridReady={(params) => { gridApiRef.current = params.api; }}
             suppressCellFocus={false}
+            preventDefaultOnContextMenu={true}
           />
         </div>
       </div>
+
+      {contextMenu && (
+        <div style={{
+          position: 'fixed',
+          top: contextMenu.y,
+          left: contextMenu.x,
+          backgroundColor: 'white',
+          border: '1px solid #ccc',
+          boxShadow: '0 4px 6px rgba(0,0,0,0.1)',
+          zIndex: 1000,
+          padding: '4px 0',
+          borderRadius: '4px',
+          minWidth: '150px'
+        }}>
+          <div 
+             style={{ padding: '8px 16px', cursor: 'pointer', fontSize: '13px', color: '#333' }}
+             onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#f1f5f9'}
+             onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'white'}
+             onClick={handleSetAlias}
+          >
+            📋 Set Alias for {contextMenu.a1}...
+          </div>
+        </div>
+      )}
 
       {/* Right Pane: Code View */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
