@@ -124,6 +124,47 @@ export default function App() {
   // Phase 8: Point Mode
   const [pointMode, setPointMode] = useState<{ active: boolean, cell: string, startIndex: number } | null>(null);
 
+  // Undo / Redo Global State
+  const [history, setHistory] = useState<{ formula: string, data: CellData[][] }[]>([{ formula: INITIAL_FORMULA, data: INITIAL_DATA }]);
+  const [historyIndex, setHistoryIndex] = useState(0);
+  const historyRef = useRef([{ formula: INITIAL_FORMULA, data: INITIAL_DATA }]);
+  const historyIndexRef = useRef(0);
+  const isUndoingRef = useRef(false);
+
+  useEffect(() => {
+    if (isUndoingRef.current) {
+       isUndoingRef.current = false;
+       return;
+    }
+    const timer = setTimeout(() => {
+       const tip = historyRef.current[historyIndexRef.current];
+       if (tip && (tip.formula !== formulaState || JSON.stringify(tip.data) !== JSON.stringify(dataState))) {
+          const newHist = historyRef.current.slice(0, historyIndexRef.current + 1);
+          newHist.push({ formula: formulaState, data: dataState });
+          historyRef.current = newHist;
+          historyIndexRef.current = newHist.length - 1;
+          setHistory(newHist);
+          setHistoryIndex(newHist.length - 1);
+       }
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [formulaState, dataState]);
+
+  const handleExport = () => {
+    const backup = {
+      timestamp: new Date().toISOString(),
+      formulaState,
+      dataState
+    };
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `next-formula-state.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   // Parse global aliases map to show inside the grid
   const cellAliases = useMemo(() => {
     const map = new Map<string, string>(); // A1 -> AliasName
@@ -159,6 +200,32 @@ export default function App() {
   // Copy / Paste handling
   useEffect(() => {
     const handleKeyDown = async (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+         if (e.key.toLowerCase() === 'z' && !e.shiftKey) {
+            if (historyIndexRef.current > 0) {
+               isUndoingRef.current = true;
+               const prev = historyRef.current[historyIndexRef.current - 1];
+               setFormulaState(prev.formula);
+               setDataState(prev.data);
+               historyIndexRef.current -= 1;
+               setHistoryIndex(historyIndexRef.current);
+            }
+            e.preventDefault();
+            return;
+         } else if (e.key.toLowerCase() === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey)) {
+            if (historyIndexRef.current < historyRef.current.length - 1) {
+               isUndoingRef.current = true;
+               const next = historyRef.current[historyIndexRef.current + 1];
+               setFormulaState(next.formula);
+               setDataState(next.data);
+               historyIndexRef.current += 1;
+               setHistoryIndex(historyIndexRef.current);
+            }
+            e.preventDefault();
+            return;
+         }
+      }
+
       const tag = document.activeElement?.tagName.toLowerCase();
       // Ignore if user is typing into an input, textarea, or Monaco editor
       if (tag === 'input' || tag === 'textarea' || document.activeElement?.className.includes('monaco-editor')) {
@@ -407,6 +474,7 @@ export default function App() {
         rowObj[colLetter] = displayVal ?? '';
         rowObj[`_${colLetter}_isError`] = isError;
         rowObj[`_${colLetter}_isFormula`] = formulaCells.has(`${colLetter}${r + 1}`);
+        rowObj[`_${colLetter}_formula`] = parsedFormulas.get(`${colLetter}${r + 1}`) || '';
       }
       newRowData.push(rowObj);
     }
@@ -428,16 +496,16 @@ export default function App() {
   }, [dataState, formulaState, hf, monaco, focusedCell]);
 
   const customCellRenderer = (params: any) => {
-  const { value, data, context, colDef, rowIndex } = params;
+  const { data, context, colDef, rowIndex } = params;
   if (!data || !colDef) return null;
   const colLetter = colDef.field;
   const a1 = `${colLetter}${rowIndex + 1}`;
   
-  const aliasName = context?.cellAliases?.get(a1);
+  const cellAlias = context?.cellAliases?.get(a1);
   const isFormula = data[`_${colLetter}_isFormula`]; // Use the stored flag
   const isError = data[`_${colLetter}_isError`]; // Use the stored flag
-  let displayVal = value;
-  if (value && typeof value === 'object') {
+  let displayVal = data[colLetter];
+  if (isError) {
     displayVal = '#ERROR';
   }
 
@@ -457,17 +525,10 @@ export default function App() {
       overflow: 'hidden', whiteSpace: 'nowrap',
       display: 'flex', alignItems: 'center' // Align content vertically
     }}>
-      <span style={{ flexGrow: 1 }}>{displayVal}</span>
-      {aliasName ? (
-         <div style={{ 
-            position: 'absolute', right: '4px', top: '50%', transform: 'translateY(-50%)', 
-            fontSize: '10px', color: '#666',
-            backgroundColor: '#e2e8f0', padding: '2px 6px', borderRadius: '4px',
-            pointerEvents: 'none', userSelect: 'none', zIndex: 10
-         }}>
-           {aliasName}
-         </div>
-      ) : null}
+      <span style={{ flexGrow: 1, textOverflow: 'ellipsis', overflow: 'hidden' }}>
+         {cellAlias ? <span style={{ color: '#059669', fontWeight: 'bold', marginRight: '4px' }}>[{cellAlias}]</span> : null}
+         {displayVal}
+      </span>
     </div>
   );
 };
@@ -475,9 +536,22 @@ export default function App() {
   const columnDefs = useMemo<ColDef[]>(() => {
     return Array.from({ length: 10 }).map((_, i) => {
       const colLetter = String.fromCharCode(65 + i);
+      const colAlias = cellAliases.get(colLetter);
+      const headerName = colAlias ? `${colAlias} (${colLetter})` : colLetter;
       return { 
-        headerName: colLetter, field: colLetter, 
+        headerName, field: colLetter, 
         editable: true, width: 100, cellRenderer: customCellRenderer,
+        valueGetter: (params: any) => {
+           if (!params.data) return undefined;
+           if (params.data[`_${colLetter}_isFormula`]) {
+              return params.data[`_${colLetter}_formula`];
+           }
+           return params.data[colLetter];
+        },
+        valueSetter: (params: any) => {
+           params.data[colLetter] = params.newValue;
+           return true;
+        },
         cellClassRules: {
           'custom-selected-cell': (params: any) => {
             const ctx = params.context;
@@ -706,6 +780,13 @@ export default function App() {
       <div style={{ flex: 1, borderRight: '1px solid #ccc', display: 'flex', flexDirection: 'column' }}>
         
         <div style={{ padding: '8px 16px', background: '#f8fafc', borderBottom: '1px solid #e2e8f0', display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <button 
+             onClick={handleExport}
+             style={{ padding: '4px 12px', fontSize: '12px', background: '#3b82f6', color: 'white', border: '1px solid #2563eb', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}
+             title="Export to JSON"
+          >
+            ↓ Export JSON
+          </button>
           <div style={{ fontWeight: 'bold', width: '40px', textAlign: 'center', background: '#e2e8f0', padding: '4px', borderRadius: '4px' }}>
             {focusedCell || '-'}
           </div>
