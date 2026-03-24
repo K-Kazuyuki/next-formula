@@ -147,10 +147,36 @@ export default function App() {
   }, [formulaState, dataState]);
 
   const handleExport = () => {
+    let csv = '';
+    let maxRow = 0;
+    let maxCol = 0;
+    dataState.forEach((row, r) => {
+       row.forEach((cell, c) => {
+          if (cell && cell.value !== null && cell.value !== '') {
+             maxRow = Math.max(maxRow, r);
+             maxCol = Math.max(maxCol, c);
+          }
+       });
+    });
+    
+    for (let r = 0; r <= maxRow; r++) {
+       const rowStr: string[] = [];
+       for (let c = 0; c <= maxCol; c++) {
+          let val = dataState[r] && dataState[r][c] ? dataState[r][c].value : '';
+          if (val === null || val === undefined) val = '';
+          let strVal = String(val);
+          if (strVal.includes(',') || strVal.includes('"') || strVal.includes('\n')) {
+             strVal = `"${strVal.replace(/"/g, '""')}"`;
+          }
+          rowStr.push(strVal);
+       }
+       csv += rowStr.join(',') + '\n';
+    }
+
     const backup = {
       timestamp: new Date().toISOString(),
-      formulaState,
-      dataState
+      csv: csv.trim(),
+      formulas: formulaState
     };
     const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -473,6 +499,11 @@ export default function App() {
       newRowData.push(rowObj);
     }
     setRowData(newRowData);
+    
+    // Force immediate cell refresh to guarantee evaluated values are redrawn reliably
+    setTimeout(() => {
+       if (gridApiRef.current) gridApiRef.current.refreshCells({ force: true });
+    }, 0);
 
     if (focusedCell) {
       if (parsedFormulas.has(focusedCell)) {
@@ -562,7 +593,7 @@ export default function App() {
         }
       };
     });
-  }, []);
+  }, [cellAliases]);
 
   const commitCellChange = (a1: string, newValue: string | null | undefined) => {
     const coords = a1ToCoords(a1);
