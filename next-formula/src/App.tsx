@@ -121,6 +121,9 @@ export default function App() {
   // Phase 7: Context Menu
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, a1: string } | null>(null);
 
+  // Phase 8: Point Mode
+  const [pointMode, setPointMode] = useState<{ active: boolean, cell: string, startIndex: number } | null>(null);
+
   // Parse global aliases map to show inside the grid
   const cellAliases = useMemo(() => {
     const map = new Map<string, string>(); // A1 -> AliasName
@@ -137,7 +140,7 @@ export default function App() {
   useEffect(() => {
     if (gridApiRef.current) {
       gridApiRef.current.setGridOption('context', { selectionStart, selectionEnd, cellAliases });
-      gridApiRef.current.refreshCells({ force: true });
+      gridApiRef.current.redrawRows(); // Force complete re-render to update badges reliably
     }
   }, [selectionStart, selectionEnd, cellAliases]);
 
@@ -636,12 +639,63 @@ export default function App() {
   };
 
   const handleFormulaBarKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter' && focusedCell) {
-      commitCellChange(focusedCell, formulaBarText);
-      gridApiRef.current?.setFocusedCell(
-         parseInt(focusedCell.match(/[0-9]+/)![0]) - 1, 
-         focusedCell.match(/[A-Z]+/)![0]
-      );
+    if (e.key === 'Enter') {
+      if (focusedCell) commitCellChange(focusedCell, formulaBarText);
+      setPointMode(null);
+      return;
+    }
+
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
+      const text = formulaBarText;
+      const lastChar = text.slice(-1);
+      const isOperator = /=|\+|-|\*|\/|\(|,/.test(lastChar);
+      
+      if (isOperator || pointMode?.active) {
+        e.preventDefault();
+        
+        // Determine starting cell for the arrow movement
+        let startCell = focusedCell || 'A1';
+        if (pointMode?.active) {
+          startCell = pointMode.cell;
+        }
+
+        const colLetter = startCell.match(/[A-Z]+/)?.[0] || 'A';
+        const rowNum = parseInt(startCell.match(/[0-9]+/)?.[0] || '1', 10);
+        let colIdx = colLetter.charCodeAt(0) - 65;
+        let rowIdx = rowNum - 1;
+
+        if (e.key === 'ArrowUp') rowIdx = Math.max(0, rowIdx - 1);
+        if (e.key === 'ArrowDown') rowIdx++; // No strict max bound since grid dynamically scales
+        if (e.key === 'ArrowLeft') colIdx = Math.max(0, colIdx - 1);
+        if (e.key === 'ArrowRight') colIdx = Math.min(9, colIdx + 1); // limit to J column (10 cols)
+
+        const newCell = `${String.fromCharCode(65 + colIdx)}${rowIdx + 1}`;
+        
+        // Move selection highlight (Point Mode)
+        setSelectionStart({ col: colIdx, row: rowIdx });
+        setSelectionEnd({ col: colIdx, row: rowIdx });
+        
+        if (gridApiRef.current) {
+           gridApiRef.current.ensureIndexVisible(rowIdx);
+           gridApiRef.current.ensureColumnVisible(String.fromCharCode(65 + colIdx));
+        }
+        
+        if (pointMode?.active) {
+           // Replace the point mode cell reference with the new one
+           const newText = text.substring(0, pointMode.startIndex) + newCell;
+           setFormulaBarText(newText);
+           setPointMode({ active: true, cell: newCell, startIndex: pointMode.startIndex });
+        } else {
+           // Append new cell reference
+           const newText = text + newCell;
+           setFormulaBarText(newText);
+           setPointMode({ active: true, cell: newCell, startIndex: text.length });
+        }
+        return;
+      }
+    } else {
+       // Stop point mode if they type letters or numbers
+       if (pointMode) setPointMode(null);
     }
   };
 
