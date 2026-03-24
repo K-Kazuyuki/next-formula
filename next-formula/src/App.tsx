@@ -125,8 +125,6 @@ export default function App() {
   const [pointMode, setPointMode] = useState<{ active: boolean, cell: string, startIndex: number } | null>(null);
 
   // Undo / Redo Global State
-  const [history, setHistory] = useState<{ formula: string, data: CellData[][] }[]>([{ formula: INITIAL_FORMULA, data: INITIAL_DATA }]);
-  const [historyIndex, setHistoryIndex] = useState(0);
   const historyRef = useRef([{ formula: INITIAL_FORMULA, data: INITIAL_DATA }]);
   const historyIndexRef = useRef(0);
   const isUndoingRef = useRef(false);
@@ -143,8 +141,6 @@ export default function App() {
           newHist.push({ formula: formulaState, data: dataState });
           historyRef.current = newHist;
           historyIndexRef.current = newHist.length - 1;
-          setHistory(newHist);
-          setHistoryIndex(newHist.length - 1);
        }
     }, 500);
     return () => clearTimeout(timer);
@@ -208,7 +204,6 @@ export default function App() {
                setFormulaState(prev.formula);
                setDataState(prev.data);
                historyIndexRef.current -= 1;
-               setHistoryIndex(historyIndexRef.current);
             }
             e.preventDefault();
             return;
@@ -219,7 +214,6 @@ export default function App() {
                setFormulaState(next.formula);
                setDataState(next.data);
                historyIndexRef.current += 1;
-               setHistoryIndex(historyIndexRef.current);
             }
             e.preventDefault();
             return;
