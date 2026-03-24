@@ -1,13 +1,13 @@
 import { useState, useMemo, useEffect, useRef } from 'react';
 import { AgGridReact } from 'ag-grid-react';
-import { ClientSideRowModelModule, ModuleRegistry, type ColDef } from 'ag-grid-community';
+import { AllCommunityModule, ModuleRegistry, type ColDef } from 'ag-grid-community';
 import Editor, { useMonaco } from '@monaco-editor/react';
 import { HyperFormula } from 'hyperformula';
 import 'ag-grid-community/styles/ag-grid.css';
 import 'ag-grid-community/styles/ag-theme-quartz.css';
 
 // Register AG Grid modules
-ModuleRegistry.registerModules([ClientSideRowModelModule]);
+ModuleRegistry.registerModules([AllCommunityModule]);
 
 function a1ToCoords(a1: string) {
   const match = a1.match(/^([A-Z]+)([0-9]+)$/i);
@@ -23,6 +23,56 @@ function a1ToCoords(a1: string) {
 
 function escapeRegExp(string: string) {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& means the whole matched string
+}
+
+function shiftFormula(formula: string, deltaCol: number, deltaRow: number) {
+  let shifted = formula.replace(/(^|[^A-Za-z])(\$?[A-Za-z]+)(\$?[0-9]+)\b/g, (_, prefix, colPart, rowPart) => {
+    let isAbsCol = colPart.startsWith('$');
+    let isAbsRow = rowPart.startsWith('$');
+    
+    let colStr = isAbsCol ? colPart.substring(1).toUpperCase() : colPart.toUpperCase();
+    let rowNum = isAbsRow ? parseInt(rowPart.substring(1), 10) : parseInt(rowPart, 10);
+    
+    let newColStr = colStr;
+    if (!isAbsCol && deltaCol !== 0) {
+       let cNum = 0;
+       for (let i = 0; i < colStr.length; i++) {
+           cNum = cNum * 26 + (colStr.charCodeAt(i) - 64);
+       }
+       cNum += deltaCol;
+       if (cNum < 1) cNum = 1; // prevent negative columns
+       newColStr = '';
+       let temp = cNum;
+       while (temp > 0) {
+           let rem = (temp - 1) % 26;
+           newColStr = String.fromCharCode(65 + rem) + newColStr;
+           temp = Math.floor((temp - 1) / 26);
+       }
+    }
+    
+    let newRowNum = rowNum;
+    if (!isAbsRow && deltaRow !== 0) {
+       newRowNum += deltaRow;
+       if (newRowNum < 1) newRowNum = 1;
+    }
+    
+    return prefix + (isAbsCol ? '$' : '') + newColStr + (isAbsRow ? '$' : '') + newRowNum;
+  });
+
+  // Shift alias references like [HP]2 or [HP]$2
+  shifted = shifted.replace(/(\[[^\]]+\])(\$?[0-9]+)\b/g, (_, aliasPart, rowPart) => {
+    let isAbsRow = rowPart.startsWith('$');
+    let rowNum = isAbsRow ? parseInt(rowPart.substring(1), 10) : parseInt(rowPart, 10);
+    
+    let newRowNum = rowNum;
+    if (!isAbsRow && deltaRow !== 0) {
+       newRowNum += deltaRow;
+       if (newRowNum < 1) newRowNum = 1;
+    }
+    return aliasPart + (isAbsRow ? '$' : '') + newRowNum;
+  });
+
+  return shifted;
 }
 
 export type CellData = {
@@ -61,6 +111,163 @@ export default function App() {
     instance.addSheet('Sheet1');
     return instance;
   }, []);
+
+  // Phase 5: Custom Range Selection State
+  const [selectionStart, setSelectionStart] = useState<{ col: number, row: number } | null>(null);
+  const [selectionEnd, setSelectionEnd] = useState<{ col: number, row: number } | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [internalClipboard, setInternalClipboard] = useState<{ minRow: number, minCol: number, tsv: string } | null>(null);
+
+  // Sync cell selection to grid context
+  useEffect(() => {
+    if (gridApiRef.current) {
+      gridApiRef.current.setGridOption('context', { selectionStart, selectionEnd });
+      gridApiRef.current.refreshCells({ force: true });
+    }
+  }, [selectionStart, selectionEnd]);
+
+  // Global mouseup to stop dragging
+  useEffect(() => {
+    const handleMouseUp = () => setIsDragging(false);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => window.removeEventListener('mouseup', handleMouseUp);
+  }, []);
+
+  // Copy / Paste handling
+  useEffect(() => {
+    const handleKeyDown = async (e: KeyboardEvent) => {
+      const tag = document.activeElement?.tagName.toLowerCase();
+      // Ignore if user is typing into an input, textarea, or Monaco editor
+      if (tag === 'input' || tag === 'textarea' || document.activeElement?.className.includes('monaco-editor')) {
+         return; 
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
+         if (!selectionStart || !selectionEnd) return;
+         const minCol = Math.min(selectionStart.col, selectionEnd.col);
+         const maxCol = Math.max(selectionStart.col, selectionEnd.col);
+         const minRow = Math.min(selectionStart.row, selectionEnd.row);
+         const maxRow = Math.max(selectionStart.row, selectionEnd.row);
+         
+         const lines = formulaState.split('\n');
+         
+         const aliases = new Map<string, string>();
+         lines.forEach(line => {
+           const matchAlias = line.match(/^ALIAS\s+\[(.*?)\]\s*=\s*([A-Z0-9]+)$/i);
+           if (matchAlias) { aliases.set(matchAlias[1], matchAlias[2].toUpperCase()); }
+         });
+         const resolveAliases = (text: string) => {
+           let resolved = text;
+           aliases.forEach((ref, name) => {
+             const regex = new RegExp(`\\[${escapeRegExp(name)}\\]`, 'gi');
+             resolved = resolved.replace(regex, ref);
+           });
+           return resolved;
+         };
+
+         let tsv = '';
+         for (let r = minRow; r <= maxRow; r++) {
+            const rowVals = [];
+            for (let c = minCol; c <= maxCol; c++) {
+               const colLetter = String.fromCharCode(65 + c);
+               const a1 = `${colLetter}${r + 1}`;
+               
+               let cellFormula = '';
+               lines.forEach(line => {
+                  if (line.toUpperCase().startsWith('ALIAS ')) return;
+                  const resolvedLine = resolveAliases(line);
+                  const match = resolvedLine.match(/^([A-Z]+[0-9]+)\s*=\s*(.*)$/i);
+                  if (match && match[1].trim().toUpperCase() === a1) {
+                     const originalMatch = line.match(/^(?:.*?)\s*=\s*(.*)$/i);
+                     cellFormula = '=' + (originalMatch ? originalMatch[1].trim() : match[2].trim());
+                  }
+               });
+               
+               if (cellFormula) {
+                  rowVals.push(cellFormula);
+               } else if (dataState[r] && dataState[r][c] && dataState[r][c].value != null) {
+                  rowVals.push(String(dataState[r][c].value));
+               } else {
+                  rowVals.push('');
+               }
+            }
+            tsv += rowVals.join('\t') + '\n';
+         }
+         navigator.clipboard.writeText(tsv);
+         setInternalClipboard({ minRow, minCol, tsv });
+         
+         // Optional: Visual feedback or just prevent default
+         e.preventDefault();
+         
+      } else if ((e.ctrlKey || e.metaKey) && e.key === 'v') {
+         if (!selectionStart || !selectionEnd) return;
+         const text = await navigator.clipboard.readText();
+         if (!text) return;
+         
+         const minCol = Math.min(selectionStart.col, selectionEnd.col);
+         const minRow = Math.min(selectionStart.row, selectionEnd.row);
+         
+         const pasteRows = text.split(/\r?\n/).map(line => line.split('\t'));
+         if (pasteRows.length > 0 && pasteRows[pasteRows.length - 1].length === 1 && pasteRows[pasteRows.length - 1][0] === '') {
+             pasteRows.pop(); // Remove trailing empty newline
+         }
+
+         let deltaRow = 0;
+         let deltaCol = 0;
+         if (internalClipboard && internalClipboard.tsv === text) {
+            deltaRow = minRow - internalClipboard.minRow;
+            deltaCol = minCol - internalClipboard.minCol;
+         }
+
+         const newFormulaLines = [...formulaState.split('\n')];
+         const newData = [...dataState];
+
+         for (let pr = 0; pr < pasteRows.length; pr++) {
+            const rowVals = pasteRows[pr];
+            const targetRow = minRow + pr;
+            while(newData.length <= targetRow) newData.push(Array(10).fill({ value: null, isFormula: false }));
+            const rArray = [...newData[targetRow]];
+
+            for (let pc = 0; pc < rowVals.length; pc++) {
+               let val = rowVals[pc];
+               // Apply relative/absolute shifting
+               if (val.startsWith('=') && (deltaRow !== 0 || deltaCol !== 0)) {
+                  val = shiftFormula(val, deltaCol, deltaRow);
+               }
+
+               const targetCol = minCol + pc;
+               const colLetter = String.fromCharCode(65 + targetCol);
+               const a1 = `${colLetter}${targetRow + 1}`;
+               
+               // Remove old formula if any
+               const existingIdx = newFormulaLines.findIndex(l => {
+                  const match = l.match(/^([A-Z]+[0-9]+)\s*=\s*/i);
+                  return match && match[1].trim().toUpperCase() === a1;
+               });
+               if (existingIdx >= 0) newFormulaLines.splice(existingIdx, 1);
+
+               if (val.startsWith('=')) {
+                  newFormulaLines.push(`${a1} = ${val.substring(1).trim()}`);
+                  while(rArray.length <= targetCol) rArray.push({ value: null, isFormula: false });
+                  rArray[targetCol] = { value: null, isFormula: true };
+               } else {
+                  while(rArray.length <= targetCol) rArray.push({ value: null, isFormula: false });
+                  const numVal = Number(val);
+                  rArray[targetCol] = { value: val === '' ? null : (isNaN(numVal) ? val : numVal), isFormula: false };
+               }
+            }
+            newData[targetRow] = rArray;
+         }
+
+         setFormulaState(newFormulaLines.join('\n'));
+         setDataState(newData);
+         e.preventDefault();
+      }
+    };
+    
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectionStart, selectionEnd, formulaState, dataState, internalClipboard]);
 
   useEffect(() => {
     const sheetId = hf.getSheetId('Sheet1')!;
@@ -228,7 +435,21 @@ export default function App() {
       const colLetter = String.fromCharCode(65 + i);
       return { 
         headerName: colLetter, field: colLetter, 
-        editable: true, width: 100, cellRenderer: customCellRenderer
+        editable: true, width: 100, cellRenderer: customCellRenderer,
+        cellClassRules: {
+          'custom-selected-cell': (params: any) => {
+            const ctx = params.context;
+            if (!ctx || !ctx.selectionStart || !ctx.selectionEnd) return false;
+            const minCol = Math.min(ctx.selectionStart.col, ctx.selectionEnd.col);
+            const maxCol = Math.max(ctx.selectionStart.col, ctx.selectionEnd.col);
+            const minRow = Math.min(ctx.selectionStart.row, ctx.selectionEnd.row);
+            const maxRow = Math.max(ctx.selectionStart.row, ctx.selectionEnd.row);
+            
+            const colIndex = params.colDef.field.charCodeAt(0) - 65;
+            const rowIndex = params.node.rowIndex;
+            return colIndex >= minCol && colIndex <= maxCol && rowIndex >= minRow && rowIndex <= maxRow;
+          }
+        }
       };
     });
   }, []);
@@ -330,6 +551,29 @@ export default function App() {
     if (params.column == null || params.rowIndex == null) return;
     const a1 = `${params.column.getColId()}${params.rowIndex + 1}`;
     setFocusedCell(a1);
+    
+    // Also use focused cell as selection start if we are not dragging
+    if (!isDragging) {
+       const colIndex = params.column.getColId().charCodeAt(0) - 65;
+       setSelectionStart({ col: colIndex, row: params.rowIndex });
+       setSelectionEnd({ col: colIndex, row: params.rowIndex });
+    }
+  };
+
+  const onCellMouseDown = (params: any) => {
+    if (params.event.button !== 0) return; // Only left click
+    const colIndex = params.column.getColId().charCodeAt(0) - 65;
+    const rowIndex = params.rowIndex;
+    setSelectionStart({ col: colIndex, row: rowIndex });
+    setSelectionEnd({ col: colIndex, row: rowIndex });
+    setIsDragging(true);
+  };
+
+  const onCellMouseOver = (params: any) => {
+    if (!isDragging) return;
+    const colIndex = params.column.getColId().charCodeAt(0) - 65;
+    const rowIndex = params.rowIndex;
+    setSelectionEnd({ col: colIndex, row: rowIndex });
   };
 
   const handleFormulaBarKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -364,12 +608,16 @@ export default function App() {
 
         <div className="ag-theme-quartz" style={{ flex: 1, height: '100%' }}>
           <AgGridReact
+            context={{ selectionStart, selectionEnd }}
             rowData={rowData}
             columnDefs={columnDefs}
             getRowId={(params) => params.data.id}
             onCellValueChanged={onCellValueChanged}
             onCellFocused={onCellFocused}
+            onCellMouseDown={onCellMouseDown}
+            onCellMouseOver={onCellMouseOver}
             onGridReady={(params) => { gridApiRef.current = params.api; }}
+            suppressCellFocus={false}
           />
         </div>
       </div>
