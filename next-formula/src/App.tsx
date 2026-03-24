@@ -128,7 +128,7 @@ export default function App() {
   const cellAliases = useMemo(() => {
     const map = new Map<string, string>(); // A1 -> AliasName
     formulaState.split('\n').forEach(line => {
-      const matchAlias = line.match(/^ALIAS\s+\[(.*?)\]\s*=\s*([A-Z0-9]+)$/i);
+      const matchAlias = line.match(/^ALIAS\s+\[(.*?)\]\s*=\s*([A-Z0-9]+)\s*$/i);
       if (matchAlias) {
          map.set(matchAlias[2].toUpperCase(), matchAlias[1]);
       }
@@ -140,7 +140,7 @@ export default function App() {
   useEffect(() => {
     if (gridApiRef.current) {
       gridApiRef.current.setGridOption('context', { selectionStart, selectionEnd, cellAliases });
-      gridApiRef.current.redrawRows(); // Force complete re-render to update badges reliably
+      gridApiRef.current.refreshCells({ force: true }); // Use refreshCells to prevent screen flashing
     }
   }, [selectionStart, selectionEnd, cellAliases]);
 
@@ -458,16 +458,16 @@ export default function App() {
       display: 'flex', alignItems: 'center' // Align content vertically
     }}>
       <span style={{ flexGrow: 1 }}>{displayVal}</span>
-      {aliasName && (
-         <span style={{ 
+      {aliasName ? (
+         <div style={{ 
             position: 'absolute', right: '4px', top: '50%', transform: 'translateY(-50%)', 
-            fontSize: '10px', color: '#888',
-            backgroundColor: '#eee', padding: '2px 4px', borderRadius: '4px',
-            pointerEvents: 'none', userSelect: 'none'
+            fontSize: '10px', color: '#666',
+            backgroundColor: '#e2e8f0', padding: '2px 6px', borderRadius: '4px',
+            pointerEvents: 'none', userSelect: 'none', zIndex: 10
          }}>
            {aliasName}
-         </span>
-      )}
+         </div>
+      ) : null}
     </div>
   );
 };
@@ -496,7 +496,7 @@ export default function App() {
     });
   }, []);
 
-  const commitCellChange = (a1: string, newValue: string) => {
+  const commitCellChange = (a1: string, newValue: string | null | undefined) => {
     const coords = a1ToCoords(a1);
     if (!coords) return;
     const { col: colIndex, row: rowIndex } = coords;
@@ -510,7 +510,7 @@ export default function App() {
     // So looking for `C2 = ...` requires resolving left sides first!
     const aliases = new Map<string, string>();
     lines.forEach(line => {
-      const matchAlias = line.match(/^ALIAS\s+\[(.*?)\]\s*=\s*([A-Z0-9]+)$/i);
+      const matchAlias = line.match(/^ALIAS\s+\[(.*?)\]\s*=\s*([A-Z0-9]+)\s*$/i);
       if (matchAlias) { aliases.set(matchAlias[1], matchAlias[2].toUpperCase()); }
     });
     const resolveAliases = (text: string) => {
@@ -534,10 +534,11 @@ export default function App() {
 
     let isFormulaNext = false;
     let nextFormulaState = formulaState;
+    const safeValue = newValue || '';
 
-    if (newValue.startsWith('=')) {
+    if (safeValue.startsWith('=')) {
       isFormulaNext = true;
-      const formulaRight = newValue.substring(1).trim();
+      const formulaRight = safeValue.substring(1).trim();
       // Wait, if it was an alias [結果]2, we should probably keep it.
       // But if the user typed =100 from the UI, we just write `A1 = 100` because we don't know the preferred alias.
       // If we are replacing, maybe we just replace the whole line with `A1 = ...` for simplicity.
@@ -571,9 +572,9 @@ export default function App() {
     if (isFormulaNext) {
        rowArray[colIndex] = { value: null, isFormula: true };
     } else {
-       const numericVal = Number(newValue);
+       const numericVal = Number(safeValue);
        rowArray[colIndex] = {
-         value: newValue === '' ? null : (isNaN(numericVal) ? newValue : numericVal),
+         value: safeValue === '' ? null : (isNaN(numericVal) ? safeValue : numericVal),
          isFormula: false
        };
     }
@@ -721,6 +722,7 @@ export default function App() {
 
         <div className="ag-theme-quartz" style={{ flex: 1, height: '100%' }}>
           <AgGridReact
+            theme="legacy"
             context={{ selectionStart, selectionEnd, cellAliases }}
             rowData={rowData}
             columnDefs={columnDefs}
